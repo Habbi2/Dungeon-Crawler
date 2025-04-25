@@ -9,6 +9,9 @@ const enemies = {};
 const items = {};
 let rooms = {};
 
+// Keep track of active socket connections to prevent duplicates
+const activeConnections = new Set();
+
 // Create server
 const app = express();
 const server = http.createServer(app);
@@ -31,6 +34,23 @@ if (process.env.NODE_ENV === 'production') {
 // Socket.io connection handler
 io.on('connection', (socket) => {
   console.log('A user connected:', socket.id);
+  
+  // Check if this is a duplicate connection from the same client
+  // Socket.io handshake contains transport info and headers we can use
+  const clientId = socket.handshake.headers['x-client-id'] || socket.id;
+  
+  if (activeConnections.has(clientId)) {
+    console.log('Duplicate connection detected:', clientId);
+    // Just acknowledge the connection but don't process further
+    socket.emit('connectionStatus', { 
+      status: 'duplicate', 
+      message: 'Already connected with another socket' 
+    });
+    return;
+  }
+  
+  // Add to active connections
+  activeConnections.add(clientId);
   
   // When a player joins the game
   socket.on('playerJoin', (playerData) => {
@@ -187,7 +207,7 @@ io.on('connection', (socket) => {
         rooms[room].enemies = {};
         
         // Process each enemy and store by ID
-        enemiesData.forEach(enemyData => {
+        Object.values(enemiesData).forEach(enemyData => {
           if (enemyData.id) {
             rooms[room].enemies[enemyData.id] = enemyData;
           }
@@ -296,6 +316,10 @@ io.on('connection', (socket) => {
   // Cleanup when a player disconnects
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
+    
+    // Remove from active connections tracking
+    const clientId = socket.handshake.headers['x-client-id'] || socket.id;
+    activeConnections.delete(clientId);
     
     // Remove this player from our players object
     if (players[socket.id]) {

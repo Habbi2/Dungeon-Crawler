@@ -20,7 +20,8 @@ class MultiplayerService {
       playerId: null,
       reconnectAttempts: 0,
       maxReconnectAttempts: 10,
-      offlineMode: false
+      offlineMode: false,
+      isConnecting: false  // Add a flag to track connection attempts
     };
     
     // Event handlers
@@ -62,21 +63,36 @@ class MultiplayerService {
    */
   init(gameScene, playerData) {
     this.gameScene = gameScene;
+    this.initialPlayerData = playerData; // Store player data for use by connection handler
     
     // Use the provided Render deployment URL
     const serverUrl = 'https://dungeon-crawler-lazc.onrender.com';
     
-    // Connect to socket.io server with better connection options for mobile devices
+    // Check if we're already connecting or connected
+    if (this.connectionState.isConnecting || this.connectionState.connected) {
+      console.log('Already connecting or connected to server, skipping new connection');
+      return;
+    }
+    
+    // Set connecting state
+    this.connectionState.isConnecting = true;
+    
+    // Connect to socket.io server with optimized connection options for better WebSocket reliability
     this.socket = io(serverUrl, {
       reconnection: true,
-      reconnectionAttempts: 15, // Increase from 10 to 15
+      reconnectionAttempts: 15,
       reconnectionDelay: 1000,
-      reconnectionDelayMax: 10000, // Increase from 5000 to 10000
-      timeout: 30000, // Increase from 20000 to 30000
-      transports: ['polling', 'websocket'], // Try polling first, then WebSocket (better for mobile)
-      upgrade: true, // Explicitly allow transport upgrade
-      forceNew: true, // Use a new connection each time
-      autoConnect: false // Don't connect automatically, we'll do it manually
+      reconnectionDelayMax: 10000,
+      timeout: 30000,
+      transports: ['websocket', 'polling'], // Try WebSocket first as primary transport
+      upgrade: true,
+      forceNew: true,
+      autoConnect: false, // We'll connect manually
+      withCredentials: false, // Helps with some CORS issues
+      extraHeaders: {
+        "pragma": "no-cache",
+        "cache-control": "no-cache"
+      }
     });
     
     // Set up connection event handlers
@@ -87,16 +103,11 @@ class MultiplayerService {
     
     // Manually connect after a short delay to allow for page to fully load
     setTimeout(() => {
-      this.socket.connect();
+      console.log('Connecting to game server...');
+      if (!this.connectionState.connected) {
+        this.socket.connect();
+      }
     }, 500);
-    
-    // Join the game once connected
-    this.socket.on('connect', () => {
-      this.connectionState.connected = true;
-      this.connectionState.playerId = this.socket.id;
-      this.connectionState.reconnectAttempts = 0;
-      this.joinGame(playerData);
-    });
   }
   
   /**
@@ -107,8 +118,10 @@ class MultiplayerService {
     this.socket.on('connect', () => {
       console.log('Connected to server!');
       this.connectionState.connected = true;
+      this.connectionState.isConnecting = false; // Reset connecting flag
       this.connectionState.reconnecting = false;
       this.connectionState.error = null;
+      this.connectionState.playerId = this.socket.id;
       
       // Clear any reconnect timers
       if (this.reconnectTimer) {
@@ -118,6 +131,11 @@ class MultiplayerService {
       
       // Reset reconnect attempts
       this.connectionState.reconnectAttempts = 0;
+      
+      // Join the game with the initial player data on first connect
+      if (this.initialPlayerData) {
+        this.joinGame(this.initialPlayerData);
+      }
       
       // Trigger event handlers
       this.triggerEvent('connect');
@@ -129,6 +147,7 @@ class MultiplayerService {
     this.socket.on('disconnect', (reason) => {
       console.log('Disconnected from server, reason:', reason);
       this.connectionState.connected = false;
+      this.connectionState.isConnecting = false; // Reset connecting state on disconnect
       
       // If the server closed the connection, try to reconnect manually
       if (reason === 'transport close' || reason === 'transport error') {
@@ -145,6 +164,7 @@ class MultiplayerService {
     this.socket.on('connect_error', (error) => {
       console.error('Connection error:', error);
       this.connectionState.error = error.message || 'Connection failed';
+      this.connectionState.isConnecting = false; // Reset connecting state on error
       
       // Handle transport errors specially
       if (error.type === 'TransportError') {
@@ -350,10 +370,14 @@ class MultiplayerService {
   setupGameEventHandlers() {
     // Current players in the game
     this.socket.on('currentPlayers', (players) => {
+      console.log('Received current players data:', players);
+      
+      // Clear existing player tracking - important for late joiners
+      this.otherPlayers = {};
+      
       Object.keys(players).forEach((id) => {
         if (id === this.socket.id) {
           // This is our player, update local state if needed
-          // (position is controlled locally, but we might need to update other properties)
           this.triggerEvent('currentPlayer', players[id]);
         } else {
           // Other players - add them to the game
@@ -361,10 +385,14 @@ class MultiplayerService {
           this.triggerEvent('playerJoined', players[id]);
         }
       });
+      
+      console.log('Updated otherPlayers after currentPlayers event:', this.otherPlayers);
     });
     
     // New player joins
     this.socket.on('newPlayer', (playerInfo) => {
+      console.log('New player joined:', playerInfo);
+      
       // Add the new player to our tracking
       this.otherPlayers[playerInfo.id] = playerInfo;
       
@@ -374,6 +402,8 @@ class MultiplayerService {
     
     // Player disconnects
     this.socket.on('playerDisconnected', (playerInfo) => {
+      console.log('Player disconnected:', playerInfo);
+      
       // Remove from our tracking
       if (this.otherPlayers[playerInfo.id]) {
         delete this.otherPlayers[playerInfo.id];
@@ -481,8 +511,31 @@ class MultiplayerService {
     
     // Room-specific events
     this.socket.on('roomPlayers', (players) => {
-      this.otherPlayers = players;
-      this.triggerEvent('roomPlayersUpdated', players);
+      console.log('Received room players update:', players);
+      
+      // Replace all players in the room
+      this.otherPlayers = {};
+      
+      // Add all players in the current room except self
+      Object.keys(players).forEach(id => {
+        if (id !== this.socket.id) {
+          this.otherPlayers[id] = players[id];
+          this.triggerEvent('playerJoined', players[id]);
+        }
+      });
+      
+      // Notify that room players were updated
+      this.triggerEvent('roomPlayersUpdated', this.otherPlayers);
+    });
+
+    // Handle host status update
+    this.socket.on('hostStatus', (data) => {
+      console.log('Host status update:', data);
+      this.connectionState.isHost = data.isHost;
+      
+      if (data.isHost) {
+        console.log('This client is now the room host');
+      }
     });
   }
   
@@ -514,6 +567,84 @@ class MultiplayerService {
     if (this.socket && this.connectionState.connected) {
       this.socket.emit('playerMovement', movementData);
     }
+  }
+  
+  /**
+   * Ensure all enemies target the player after server sync
+   * @param {Array|Object} enemies - Collection of enemies to update
+   * @param {Object} player - The player object to set as target
+   */
+  ensureEnemiesTargetPlayer(enemies, player) {
+    if (!player) return;
+    
+    // Handle both array and object formats
+    if (Array.isArray(enemies)) {
+      enemies.forEach(enemy => {
+        if (enemy && enemy.active) {
+          this.setupEnemyBehavior(enemy, player);
+        }
+      });
+    } else if (enemies && typeof enemies === 'object') {
+      Object.values(enemies).forEach(enemy => {
+        if (enemy && enemy.active) {
+          this.setupEnemyBehavior(enemy, player);
+        }
+      });
+    }
+  }
+  
+  /**
+   * Configure proper enemy AI behavior toward player
+   * @param {Object} enemy - Enemy object to configure
+   * @param {Object} player - Player target
+   */
+  setupEnemyBehavior(enemy, player) {
+    // Set player as target
+    enemy.target = player;
+    
+    // Ensure enemy has proper AI settings
+    enemy.chasePlayer = true;
+    enemy.aggroRange = enemy.aggroRange || 200;
+    enemy.attackRange = enemy.attackRange || 40;
+    
+    // Make sure enemy's physics body won't move away on collision
+    if (enemy.body) {
+      enemy.body.pushable = false;
+    }
+    
+    // Set aggro state if player is within range
+    if (player) {
+      const dx = player.x - enemy.x;
+      const dy = player.y - enemy.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      
+      if (distance <= (enemy.aggroRange || 200)) {
+        enemy.aggro = true;
+        enemy.state = 'chase';
+      }
+    }
+  }
+
+  /**
+   * Handle server enemy updates
+   * @param {Object} enemies - The enemy data from server
+   */
+  receiveEnemyUpdates(enemies) {
+    // Update our local tracking
+    this.serverEnemies = {...enemies};
+    
+    // If we have a game scene and player, ensure enemies target the player
+    if (this.gameScene && this.gameScene.player) {
+      this.ensureEnemiesTargetPlayer(this.serverEnemies, this.gameScene.player);
+      
+      // Ensure enemy instances in the scene also target the player
+      if (this.gameScene.enemies) {
+        this.ensureEnemiesTargetPlayer(this.gameScene.enemies, this.gameScene.player);
+      }
+    }
+    
+    // Trigger event for game scene
+    this.triggerEvent('enemiesUpdated', this.serverEnemies);
   }
   
   /**
@@ -832,19 +963,103 @@ class MultiplayerService {
     
     // Only the host should sync enemies to prevent conflicts
     if (this.isHost()) {
-      const enemiesData = enemies.map(enemy => ({
-        id: enemy.id || enemy.enemyId, // Use consistent ID property
-        type: enemy.enemyType,
-        x: enemy.x,
-        y: enemy.y,
-        health: enemy.health,
-        isDead: enemy.isDead || false,
-        state: enemy.state || 'idle'
-      }));
-      
-      // Send full enemy state
-      this.socket.emit('syncEnemies', enemiesData);
+      try {
+        // Process enemies appropriately based on data format
+        let enemiesArray = enemies;
+        if (!Array.isArray(enemies)) {
+          // Handle if enemies is an object instead of array
+          enemiesArray = Object.values(enemies);
+        }
+        
+        // Skip sync if no enemies
+        if (!enemiesArray || enemiesArray.length === 0) return;
+        
+        // Build a comprehensive enemy data map with consistent IDs
+        const enemiesData = {};
+        
+        enemiesArray.forEach(enemy => {
+          // Skip null enemies
+          if (!enemy || !enemy.active) return;
+          
+          // Ensure each enemy has a consistent ID
+          const enemyId = enemy.id || enemy.enemyId || `enemy_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+          
+          // Assign ID if missing
+          if (!enemy.id && !enemy.enemyId) {
+            enemy.id = enemyId;
+            enemy.enemyId = enemyId;
+          }
+          
+          // Get velocity from enemy body
+          let velocityX = 0;
+          let velocityY = 0;
+          
+          if (enemy.body) {
+            velocityX = enemy.body.velocity ? enemy.body.velocity.x : 0;
+            velocityY = enemy.body.velocity ? enemy.body.velocity.y : 0;
+          }
+          
+          // Force isMoving to be true if velocity indicates movement
+          const isMoving = 
+            (Math.abs(velocityX) > 1 || Math.abs(velocityY) > 1) || 
+            (enemy.isMoving === true);
+          
+          // Get current direction from enemy
+          let direction = enemy.direction || 'down';
+          
+          // Create a comprehensive data object for this enemy
+          enemiesData[enemyId] = {
+            id: enemyId,
+            type: enemy.enemyType || enemy.type || 'skeleton',
+            x: enemy.x,
+            y: enemy.y,
+            health: enemy.health || 100,
+            maxHealth: enemy.maxHealth || 100,
+            isDead: enemy.isDead || false,
+            // Critical movement data
+            isMoving: isMoving,
+            velocityX: velocityX,
+            velocityY: velocityY,
+            direction: direction,
+            animation: enemy.anims && enemy.anims.currentAnim ? enemy.anims.currentAnim.key : null,
+            speed: enemy.speed || 50,
+            state: enemy.state || 'idle', // Add enemy state
+            aggro: enemy.aggro || false, // Add aggro state
+            target: enemy.target ? { x: enemy.target.x, y: enemy.target.y } : null, // Add target info
+            lastUpdate: Date.now()
+          };
+        });
+        
+        // Only send update if there are valid enemies to sync
+        if (Object.keys(enemiesData).length > 0) {
+          this.socket.emit('syncEnemies', enemiesData);
+        }
+      } catch (error) {
+        console.error("Error syncing enemies:", error);
+      }
     }
+  }
+  
+  /**
+   * Handle server enemy updates
+   * @param {Object} enemies - The enemy data from server
+   */
+  receiveEnemyUpdates(enemies) {
+    // Update our local tracking
+    this.serverEnemies = {...enemies};
+    
+    // If we have a game scene and player, ensure enemies target the player
+    if (this.gameScene && this.gameScene.player) {
+      this.ensureEnemiesTargetPlayer(this.serverEnemies, this.gameScene.player);
+      
+      // Ensure enemy instances in the scene also target the player
+      if (this.gameScene.enemies) {
+        this.ensureEnemiesTargetPlayer(this.gameScene.enemies, this.gameScene.player);
+      }
+    }
+    
+    // Trigger event for game scene
+    this.triggerEvent('enemiesUpdated', this.serverEnemies);
   }
   
   /**
@@ -856,39 +1071,187 @@ class MultiplayerService {
     
     // Only the host should sync items to prevent conflicts
     if (this.isHost()) {
-      const itemsData = items.map(item => ({
-        id: item.id || item.itemId || `item_${items.indexOf(item)}`,
-        type: item.itemType,
-        x: item.x,
-        y: item.y,
-        collected: item.collected || false
-      }));
+      // Create a comprehensive items data map with consistent IDs
+      const itemsData = {};
       
+      // Process items from Phaser group or array
+      if (items.getChildren) {
+        // If it's a Phaser group, use getChildren()
+        items.getChildren().forEach((item, index) => {
+          this.processItemForSync(item, index, itemsData);
+        });
+      } else {
+        // Otherwise treat as array
+        items.forEach((item, index) => {
+          this.processItemForSync(item, index, itemsData);
+        });
+      }
+      
+      // Send full items state
       this.socket.emit('syncItems', itemsData);
     }
   }
   
   /**
-   * Request a full sync from the server
+   * Process individual item for sync
+   * @param {Object} item - Item object
+   * @param {number} index - Index for ID generation
+   * @param {Object} itemsData - Data object to add to
    */
-  requestFullSync() {
-    if (!this.socket || !this.connectionState.connected) return;
+  processItemForSync(item, index, itemsData) {
+    // Ensure each item has a consistent ID
+    const itemId = item.id || item.itemId || `item_${Date.now()}_${index}`;
     
-    this.socket.emit('requestFullSync', {
-      room: this.gameScene.roomId || 'default'
-    });
+    // Assign ID if missing
+    if (!item.id && !item.itemId) {
+      item.id = itemId;
+      item.itemId = itemId;
+    }
+    
+    // Add to data map with complete properties
+    itemsData[itemId] = {
+      id: itemId,
+      type: item.itemType || 'unknown',
+      x: item.x,
+      y: item.y,
+      collected: item.collected || false,
+      quality: item.quality || 'normal',
+      value: item.value || 1,
+      isOpen: item.isOpen || false,
+      lastUpdate: Date.now()
+    };
   }
   
   /**
-   * Check if this client is the host (first player in the room)
-   * @returns {boolean} Whether this client is the host
+   * Handle server item updates
+   * @param {Object} items - The item data from server
+   */
+  receiveItemUpdates(items) {
+    // Update our local tracking with full replace to avoid stale items
+    this.serverItems = {...items};
+    
+    // Trigger event for game scene
+    this.triggerEvent('itemsUpdated', this.serverItems);
+  }
+  
+  /**
+   * Request a full synchronization of game state from the server
+   * This is useful for late joiners or after reconnection
+   */
+  requestFullSync() {
+    if (this.socket && this.connectionState.connected) {
+      console.log('Requesting full game state sync from server');
+      this.socket.emit('requestFullSync', {
+        room: this.gameScene?.roomId || 'default'
+      });
+    } else {
+      console.error('Cannot request full sync: Not connected to server');
+    }
+  }
+  
+  /**
+   * Synchronize all game state at once - comprehensive sync method
+   * @param {Object} gameState - Current game state to synchronize
+   */
+  syncGameState(gameState) {
+    if (!this.socket || !this.connectionState.connected) return;
+    
+    // Only the host should sync full state to prevent conflicts
+    if (this.isHost()) {
+      const fullState = {
+        players: {},
+        enemies: {},
+        items: {},
+        timestamp: Date.now(),
+        room: this.gameScene?.roomId || 'default',
+        seed: gameState.seed || null
+      };
+      
+      // Synchronize players
+      if (gameState.players) {
+        Object.keys(gameState.players).forEach(id => {
+          const player = gameState.players[id];
+          fullState.players[id] = {
+            id: id,
+            name: player.name || 'Player',
+            x: player.x,
+            y: player.y,
+            health: player.health || 100,
+            direction: player.direction || 'down',
+            animation: player.animation || 'player_idle_down',
+            isAttacking: player.isAttacking || false,
+            lastUpdated: Date.now()
+          };
+        });
+      }
+      
+      // Synchronize enemies
+      if (gameState.enemies && gameState.enemies.length > 0) {
+        gameState.enemies.forEach(enemy => {
+          const enemyId = enemy.id || enemy.enemyId || `enemy_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+          
+          // Assign ID if missing
+          if (!enemy.id && !enemy.enemyId) {
+            enemy.id = enemyId;
+            enemy.enemyId = enemyId;
+          }
+          
+          // Add to data map
+          fullState.enemies[enemyId] = {
+            id: enemyId,
+            type: enemy.enemyType || 'skeleton',
+            x: enemy.x,
+            y: enemy.y,
+            health: enemy.health || 100,
+            maxHealth: enemy.maxHealth || 100,
+            isDead: enemy.isDead || false,
+            state: enemy.state || 'idle',
+            lastUpdate: Date.now()
+          };
+        });
+      }
+      
+      // Synchronize items
+      if (gameState.items) {
+        // Handle both arrays and Phaser Groups
+        const itemArray = gameState.items.getChildren ? gameState.items.getChildren() : gameState.items;
+        
+        itemArray.forEach((item, index) => {
+          const itemId = item.id || item.itemId || `item_${Date.now()}_${index}`;
+          
+          // Assign ID if missing
+          if (!item.id && !item.itemId) {
+            item.id = itemId;
+            item.itemId = itemId;
+          }
+          
+          // Add to data map with complete properties
+          fullState.items[itemId] = {
+            id: itemId,
+            type: item.itemType || 'unknown',
+            x: item.x,
+            y: item.y,
+            collected: item.collected || false,
+            quality: item.quality || 'normal',
+            value: item.value || 1,
+            isOpen: item.isOpen || false,
+            lastUpdate: Date.now()
+          };
+        });
+      }
+      
+      // Send full state to server
+      this.socket.emit('syncGameState', fullState);
+      console.log('Full game state synchronized with server');
+    }
+  }
+  
+  /**
+   * Check if the current client is the host
+   * @returns {boolean} True if this client is the host
    */
   isHost() {
-    // If we're the first player to join, we're the host
-    // The server should send this information
-    return this.connectionState.isHost || 
-           (this.gameScene && this.gameScene.isHost) || 
-           Object.keys(this.otherPlayers).length === 0;
+    return this.connectionState.isHost === true;
   }
 }
 

@@ -33,6 +33,9 @@ class Player extends Phaser.Physics.Arcade.Sprite {
     this.body.setSize(12, 12); // Smaller hitbox than sprite
     this.body.setOffset(2, 4);
     
+    // Set appropriate depth to ensure player appears above the map
+    this.setDepth(10);
+    
     // Set up input handling
     this.keys = scene.input.keyboard.addKeys({
       up: Phaser.Input.Keyboard.KeyCodes.W,
@@ -60,6 +63,9 @@ class Player extends Phaser.Physics.Arcade.Sprite {
     
     // Update UI initially
     this.updateUI();
+    
+    // Ensure collision volumes are initialized properly
+    this.safeInitializeCollisionDetection();
   }
   
   createAttackHitbox() {
@@ -90,6 +96,28 @@ class Player extends Phaser.Physics.Arcade.Sprite {
     }
   }
   
+  // Safety method for initializing collision-related properties
+  safeInitializeCollisionDetection() {
+    if (!this.body) {
+      console.warn('Player body not initialized properly');
+      return;
+    }
+    
+    // Set up collision volumes appropriately 
+    this.body.setCollideWorldBounds(true);
+    
+    // Ensure we have a valid physics body for collision detection
+    if (!this.body.checkCollision) {
+      this.body.checkCollision = {
+        none: false,
+        up: true,
+        down: true,
+        left: true,
+        right: true
+      };
+    }
+  }
+
   update() {
     // Safety check - ensure body exists before using it
     if (!this.body) return;
@@ -596,6 +624,7 @@ class Player extends Phaser.Physics.Arcade.Sprite {
     this.scene.events.emit('playerInventoryChanged', this.inventory);
   }
   
+  // Ensure both versions of the method name work (original and possibly misspelled version)
   setInvulnerable(value) {
     this.isInvulnerable = value;
     
@@ -604,6 +633,44 @@ class Player extends Phaser.Physics.Arcade.Sprite {
       this.alpha = 0.7;
     } else {
       this.alpha = 1;
+    }
+  }
+  
+  // Add potential alternative spelling that might be used elsewhere
+  setInvincible(value) {
+    // Call the actual method
+    this.setInvulnerable(value);
+  }
+  
+  // Helper method to track map seed changes
+  reportMapSeedChange(oldSeed, newSeed) {
+    console.log(`Map seed changed: ${oldSeed} → ${newSeed}`);
+    
+    // If seeds are rapidly changing, store the last few for analysis
+    if (!this.scene.recentSeeds) {
+      this.scene.recentSeeds = [];
+    }
+    
+    this.scene.recentSeeds.push({
+      time: Date.now(),
+      oldSeed,
+      newSeed
+    });
+    
+    // Keep only the last 5 seed changes
+    if (this.scene.recentSeeds.length > 5) {
+      this.scene.recentSeeds.shift();
+    }
+    
+    // If we have multiple rapid seed changes, log a warning
+    if (this.scene.recentSeeds.length >= 2) {
+      const lastChange = this.scene.recentSeeds[this.scene.recentSeeds.length - 1];
+      const previousChange = this.scene.recentSeeds[this.scene.recentSeeds.length - 2];
+      
+      const timeDiff = lastChange.time - previousChange.time;
+      if (timeDiff < 1000) {
+        console.warn(`Rapid map seed changes detected: ${timeDiff}ms between changes!`);
+      }
     }
   }
 }

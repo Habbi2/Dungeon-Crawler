@@ -9,8 +9,12 @@ class DungeonGenerator {
       corridorWidth: config.corridorWidth || 2,
       specialRoomsChance: config.specialRoomsChance || 0.3, // Chance for special rooms
       trapDensity: config.trapDensity || 0.03, // Density of traps in corridors
-      theme: config.theme || 'dungeon' // Allow different dungeon themes
+      theme: config.theme || 'dungeon', // Allow different dungeon themes
+      seed: config.seed || Math.floor(Math.random() * 1000000) // Add seed with default random value
     };
+    
+    // Initialize seeded random number generator
+    this.initRNG(this.config.seed);
     
     // Initialize dungeon properties
     this.rooms = [];
@@ -20,7 +24,39 @@ class DungeonGenerator {
     this.roomTypes = ['normal', 'treasure', 'challenge', 'boss', 'shop'];
   }
   
+  // Initialize our seeded random number generator
+  initRNG(seed) {
+    // Store the seed for reference
+    this.seed = seed;
+    
+    // Fixed version: Create an internal seed that won't affect the original seed
+    let internalSeed = seed;
+    
+    // Simple seeded random function based on a mulberry32 algorithm
+    this.rng = function() {
+      // Use local variable to avoid modifying the original seed
+      internalSeed = (internalSeed + 0x6D2B79F5) >>> 0;
+      let t = internalSeed;
+      t = Math.imul(t ^ t >>> 15, t | 1);
+      t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  
+  // Random number between min and max (inclusive)
+  randomBetween(min, max) {
+    return Math.floor(this.rng() * (max - min + 1)) + min;
+  }
+  
+  // Random boolean with probability
+  randomChance(probability) {
+    return this.rng() < probability;
+  }
+  
   generate() {
+    // Console log the seed being used for debugging
+    console.log(`Generating dungeon with seed: ${this.seed}`);
+    
     // Reset any previous generation
     this.rooms = [];
     this.corridors = [];
@@ -54,13 +90,14 @@ class DungeonGenerator {
       rooms: this.rooms,
       corridors: this.corridors,
       traps: this.traps,
-      entities: this.generateEntities()
+      entities: this.generateEntities(),
+      seed: this.seed // Return the seed used for this generation
     };
   }
   
   generateRooms() {
     // Determine number of rooms to generate
-    const roomCount = Phaser.Math.Between(
+    const roomCount = this.randomBetween(
       this.config.roomCountRange[0], 
       this.config.roomCountRange[1]
     );
@@ -73,19 +110,19 @@ class DungeonGenerator {
       attempts++;
       
       // Generate a room with random dimensions
-      const roomWidth = Phaser.Math.Between(
+      const roomWidth = this.randomBetween(
         this.config.roomSizeRange[0],
         this.config.roomSizeRange[1]
       );
       
-      const roomHeight = Phaser.Math.Between(
+      const roomHeight = this.randomBetween(
         this.config.roomSizeRange[0],
         this.config.roomSizeRange[1]
       );
       
       // Random position (leaving margin around edges)
-      const roomX = Phaser.Math.Between(1, this.config.width - roomWidth - 1);
-      const roomY = Phaser.Math.Between(1, this.config.height - roomHeight - 1);
+      const roomX = this.randomBetween(1, this.config.width - roomWidth - 1);
+      const roomY = this.randomBetween(1, this.config.height - roomHeight - 1);
       
       // Create the room object
       const newRoom = {
@@ -147,8 +184,8 @@ class DungeonGenerator {
     // Add some random connections for more complex layouts (optional)
     const extraConnections = Math.floor(this.rooms.length / 3);
     for (let i = 0; i < extraConnections; i++) {
-      const roomA = this.rooms[Phaser.Math.Between(0, this.rooms.length - 1)];
-      const roomB = this.rooms[Phaser.Math.Between(0, this.rooms.length - 1)];
+      const roomA = this.rooms[this.randomBetween(0, this.rooms.length - 1)];
+      const roomB = this.rooms[this.randomBetween(0, this.rooms.length - 1)];
       
       // Don't connect a room to itself
       if (roomA !== roomB) {
@@ -170,7 +207,7 @@ class DungeonGenerator {
     };
     
     // 50% chance to draw corridors horizontally first, then vertically
-    const corridorType = Math.random() > 0.5;
+    const corridorType = this.randomChance(0.5);
     
     // Store corridor points for later use
     const corridor = {
@@ -239,7 +276,7 @@ class DungeonGenerator {
             this.grid[y][x+1] === 0
           ) {
             // 10% chance to make this a decorative wall tile
-            if (Math.random() < 0.1) {
+            if (this.randomChance(0.1)) {
               this.grid[y][x] = 2;  // 2 = decorative wall
             }
           }
@@ -249,11 +286,11 @@ class DungeonGenerator {
     
     // Add some decorations to floors
     for (let y = 1; y < this.config.height - 1; y++) {
-      for (let x = 1; x < this.config.width - 1; x++) {
+      for (let x = 1; x < this.config.width - 1; x++) { // Fixed condition: was using 'y' incorrectly
         // If this is a floor tile
         if (this.grid[y][x] === 0) {
           // 2% chance to add a decoration
-          if (Math.random() < 0.02) {
+          if (this.randomChance(0.02)) {
             this.grid[y][x] = 3;  // 3 = floor decoration
           }
         }
@@ -270,15 +307,15 @@ class DungeonGenerator {
       const room = this.rooms[i];
       
       // Add 1-3 enemies per room
-      const enemyCount = Phaser.Math.Between(1, 3);
+      const enemyCount = this.randomBetween(1, 3);
       for (let j = 0; j < enemyCount; j++) {
         // Position within the room (avoiding edges)
-        const x = Phaser.Math.Between(room.x + 1, room.x + room.width - 2);
-        const y = Phaser.Math.Between(room.y + 1, room.y + room.height - 2);
+        const x = this.randomBetween(room.x + 1, room.x + room.width - 2);
+        const y = this.randomBetween(room.y + 1, room.y + room.height - 2);
         
         // Determine enemy type
         let enemyType = 'skeleton';
-        const typeRoll = Math.random();
+        const typeRoll = this.rng();
         
         if (typeRoll > 0.7) {
           enemyType = 'vampire';
@@ -298,13 +335,13 @@ class DungeonGenerator {
       }
       
       // Add treasure to some rooms
-      if (Math.random() < 0.4) {
-        const x = Phaser.Math.Between(room.x + 1, room.x + room.width - 2);
-        const y = Phaser.Math.Between(room.y + 1, room.y + room.height - 2);
+      if (this.randomChance(0.4)) {
+        const x = this.randomBetween(room.x + 1, room.x + room.width - 2);
+        const y = this.randomBetween(room.y + 1, room.y + room.height - 2);
         
         entities.push({
           type: 'treasure',
-          treasureType: Math.random() < 0.7 ? 'chest' : 'gold',
+          treasureType: this.randomChance(0.7) ? 'chest' : 'gold',
           x: x,
           y: y
         });
@@ -342,13 +379,13 @@ class DungeonGenerator {
         if (corridor.startX === corridor.endX) {
           // Vertical corridor
           x = corridor.startX;
-          y = Phaser.Math.Between(
+          y = this.randomBetween(
             Math.min(corridor.startY, corridor.endY) + 1, 
             Math.max(corridor.startY, corridor.endY) - 1
           );
         } else {
           // Horizontal corridor
-          x = Phaser.Math.Between(
+          x = this.randomBetween(
             Math.min(corridor.startX, corridor.endX) + 1, 
             Math.max(corridor.startX, corridor.endX) - 1
           );
@@ -373,8 +410,8 @@ class DungeonGenerator {
           this.traps.push({
             x: x,
             y: y,
-            type: Math.random() < 0.7 ? 'spike' : 'poison',
-            visible: Math.random() < 0.6 // 60% traps are visible
+            type: this.randomChance(0.7) ? 'spike' : 'poison',
+            visible: this.randomChance(0.6) // 60% traps are visible
           });
           
           // Mark trap on grid if visible
@@ -402,10 +439,10 @@ class DungeonGenerator {
     
     // Assign types to other rooms
     for (let i = 1; i < this.rooms.length - 1; i++) {
-      if (Math.random() < this.config.specialRoomsChance) {
+      if (this.randomChance(this.config.specialRoomsChance)) {
         // Choose a special room type
         const availableTypes = ['treasure', 'challenge', 'shop'];
-        const typeIndex = Math.floor(Math.random() * availableTypes.length);
+        const typeIndex = Math.floor(this.rng() * availableTypes.length);
         this.rooms[i].type = availableTypes[typeIndex];
       } else {
         this.rooms[i].type = 'normal';

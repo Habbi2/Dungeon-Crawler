@@ -24,6 +24,12 @@ class RemotePlayerManager {
     multiplayerService.on('playerDied', this.handlePlayerDied.bind(this));
     multiplayerService.on('playerRespawned', this.handlePlayerRespawn.bind(this));
     multiplayerService.on('roomPlayersUpdated', this.handleRoomPlayersUpdated.bind(this));
+    
+    // Flag to track first room update (for late joiners)
+    this._firstRoomUpdate = true;
+    
+    // Request current players immediately
+    this.requestInitialPlayers();
   }
 
   /**
@@ -316,26 +322,69 @@ class RemotePlayerManager {
    * @param {Object} players - All players in the room
    */
   handleRoomPlayersUpdated(players) {
-    // Remove any players that aren't in the new list
-    Object.keys(this.players).forEach(id => {
-      if (!players[id]) {
+    console.log("Room players updated. Total players:", Object.keys(players).length);
+    
+    // Clean up any existing players that aren't in the updated list
+    const currentIds = Object.keys(this.players);
+    const newIds = Object.keys(players);
+    
+    // Remove players no longer in the room
+    currentIds.forEach(id => {
+      if (!players[id] && id !== multiplayerService.getConnectionState().playerId) {
+        console.log(`Removing player no longer in room: ${id}`);
         this.handlePlayerLeft({ id });
       }
     });
     
     // Add or update players in the list
-    Object.keys(players).forEach(id => {
-      if (!this.players[id]) {
-        this.handlePlayerJoined(players[id]);
-      } else {
-        // Update existing player
-        this.handlePlayerMoved(players[id]);
-        this.handlePlayerHealthUpdate({
-          id,
-          health: players[id].health
-        });
+    newIds.forEach(id => {
+      if (id !== multiplayerService.getConnectionState().playerId) {
+        if (!this.players[id]) {
+          console.log(`Adding player from room update: ${id}, name: ${players[id].name}`);
+          this.handlePlayerJoined(players[id]);
+        } else {
+          // Update existing player position and state
+          this.handlePlayerMoved(players[id]);
+          if (players[id].health !== undefined) {
+            this.handlePlayerHealthUpdate({
+              id,
+              health: players[id].health
+            });
+          }
+          
+          // Update animation state if provided
+          if (players[id].animation && this.players[id]) {
+            this.players[id].anims.play(players[id].animation);
+          }
+        }
       }
     });
+    
+    // If this is the first room update (likely a late joiner), request a full sync
+    if (this._firstRoomUpdate) {
+      this._firstRoomUpdate = false;
+      console.log("First room update received, requesting full sync as late joiner");
+      
+      // Request full game state after a short delay to ensure everything is loaded
+      this.scene.time.delayedCall(300, () => {
+        multiplayerService.requestFullSync();
+      });
+    }
+  }
+  
+  /**
+   * Request initial player list when joining a game in progress
+   */
+  requestInitialPlayers() {
+    if (multiplayerService.getConnectionState().connected) {
+      console.log("Requesting initial players list");
+      multiplayerService.socket.emit('requestPlayers', {
+        room: this.scene.roomId || 'default'
+      });
+    } else {
+      // Retry after a short delay if not yet connected
+      setTimeout(() => this.requestInitialPlayers(), 500);
+    }
   }
 }
 

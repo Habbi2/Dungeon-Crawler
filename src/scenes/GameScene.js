@@ -129,6 +129,24 @@ class GameScene extends Phaser.Scene {
     multiplayerService.on('itemUpdated', this.handleItemUpdated.bind(this));
     multiplayerService.on('itemRemoved', this.handleItemRemoved.bind(this));
     
+    // Handle offline mode
+    multiplayerService.on('offlineModeEnabled', this.handleOfflineModeEnabled.bind(this));
+    multiplayerService.on('offlineModeDisabled', this.handleOfflineModeDisabled.bind(this));
+    
+    // Ensure collision layer safety in multiplayer
+    this.collisionCheckSafety = {
+      isReady: false,
+      pendingColliders: []
+    };
+    
+    // Set up sync timers
+    this.syncTimers = {
+      lastFullSync: 0,
+      fullSyncInterval: 5000, // Full sync every 5 seconds
+      lastQuickSync: 0,
+      quickSyncInterval: 500 // Quick sync every 0.5 seconds
+    };
+    
     // Initialize with player data
     multiplayerService.init(this, {
       name: this.playerName,
@@ -159,12 +177,56 @@ class GameScene extends Phaser.Scene {
   handleDungeonSeed(seed) {
     console.log('Received dungeon seed:', seed);
     
-    // Clear any existing dungeon before generating a new one
+    // Skip regeneration if already using this seed
+    if (this.currentSeed === seed) {
+      console.log('Already using this seed, skipping regeneration');
+      return; // Exit early to avoid requesting another sync
+    }
+    
+    // Store the seed for reference
+    this.currentSeed = seed;
+    
+    // Flag to track the state of regeneration
+    this.isRegeneratingMap = true;
+    
+    // Clear existing map and objects
+    this.clearExistingDungeon();
+    
+    // Generate new dungeon with the provided seed
+    this.generateDungeon(seed);
+    
+    // Add a flag to prevent multiple sync requests for the same seed
+    if (!this.hasSyncedAfterSeedChange) {
+      this.hasSyncedAfterSeedChange = true;
+      
+      // Always request a full sync after handling seed change to ensure all game objects are in sync
+      if (this.isMultiplayer && multiplayerService.getConnectionState().connected) {
+        // Add a short delay to ensure tilemap is fully initialized
+        this.time.delayedCall(200, () => {
+          // Request full state sync to get entities like enemies and items
+          multiplayerService.requestFullSync();
+          console.log('Requested full sync after map regeneration');
+          
+          // Reset the sync flag after a delay to allow for future seed changes
+          this.time.delayedCall(1000, () => {
+            this.hasSyncedAfterSeedChange = false;
+          });
+        });
+      }
+    }
+    
+    // Reset the regeneration flag
+    this.isRegeneratingMap = false;
+  }
+
+  // Helper method to clear existing dungeon elements
+  clearExistingDungeon() {
+    // Clear any existing map
     if (this.map) {
       this.map.destroy();
     }
     
-    // Clear any existing objects before recreating the level
+    // Clear any existing objects
     if (this.enemies) {
       this.enemies.forEach(enemy => {
         if (enemy && enemy.destroy) enemy.destroy();
@@ -192,23 +254,23 @@ class GameScene extends Phaser.Scene {
       this.exit.destroy();
     }
     
-    // Use the received seed for dungeon generation to ensure consistency
-    this.currentSeed = seed;
-    this.generateDungeon(seed);
+    // Explicitly clear all existing colliders to prevent issues with old references
+    this.physics.world.colliders.destroy();
     
-    // Request a full sync after dungeon generation to ensure all game objects are in sync
-    if (this.isMultiplayer && multiplayerService.getConnectionState().connected) {
-      multiplayerService.requestFullSync();
-    }
-    
-    console.log('Dungeon regenerated with seed:', seed);
+    // Reset collision check safety system
+    this.collisionCheckSafety = {
+      isReady: false,
+      pendingColliders: []
+    };
   }
 
   // Handle server-provided enemy updates
   handleEnemiesUpdated(enemies) {
     if (!this.isMultiplayer) return;
     
-    console.log('Received enemy updates from server:', enemies);
+    // Skip verbose logging to reduce console spam
+    // Only log enemy count for performance monitoring
+    console.log(`Received enemy updates from server: ${Object.keys(enemies).length} enemies`);
     
     // If we're not the host, update or create enemies
     if (!multiplayerService.isHost()) {
@@ -220,67 +282,92 @@ class GameScene extends Phaser.Scene {
         const enemyData = enemies[enemyId];
         updatedEnemies.add(enemyId);
         
-        // Find existing enemy with this ID
-        const existingEnemy = this.enemies.find(e => e.id === enemyId || e.enemyId === enemyId);
-        
-        if (existingEnemy) {
-          // Update existing enemy with smooth transition
-          this.tweens.add({
-            targets: existingEnemy,
-            x: enemyData.x,
-            y: enemyData.y,
-            duration: 100,
-            ease: 'Linear'
-          });
+        try {
+          // Find existing enemy with this ID
+          const existingEnemy = this.enemies.find(e => (e.id === enemyId || e.enemyId === enemyId));
           
-          existingEnemy.health = enemyData.health;
-          existingEnemy.isDead = enemyData.isDead;
-          
-          // Update animation state based on server data
-          if (enemyData.isDead && !existingEnemy.playedDeathAnim) {
-            existingEnemy.die();
+          if (existingEnemy) {
+            // Update existing enemy properties
+            if (typeof existingEnemy.updateFromServer === 'function') {
+              existingEnemy.updateFromServer(enemyData);
+            } else {
+              // Fallback manual update if method doesn't exist
+              existingEnemy.x = enemyData.x;
+              existingEnemy.y = enemyData.y;
+              existingEnemy.health = enemyData.health || 100;
+              existingEnemy.isDead = enemyData.isDead || false;
+              
+              if (existingEnemy.body) {
+                existingEnemy.body.setVelocity(
+                  enemyData.velocityX || 0,
+                  enemyData.velocityY || 0
+                );
+              }
+            }
+          } else {
+            // Create new enemy if it doesn't exist
+            console.log(`Creating new enemy from server data: ${enemyId}`);
+            
+            // Determine texture based on enemy type
+            let texture = 'skeleton1_idle';
+            if (enemyData.type === 'boss' || enemyData.type === 'vampire') {
+              texture = 'vampire_idle';
+            }
+            
+            // Create the enemy instance with proper error handling
+            try {
+              const newEnemy = new Enemy(
+                this, 
+                enemyData.x, 
+                enemyData.y, 
+                texture,
+                enemyData.type || 'skeleton'
+              );
+              
+              // Set initial properties
+              newEnemy.id = enemyId;
+              newEnemy.enemyId = enemyId;
+              newEnemy.health = enemyData.health || 100;
+              newEnemy.maxHealth = enemyData.maxHealth || 100;
+              newEnemy.isDead = enemyData.isDead || false;
+              newEnemy.serverControlled = true;
+              newEnemy.isMoving = enemyData.isMoving || false;
+              newEnemy.direction = enemyData.direction || 'down';
+              newEnemy.speed = enemyData.speed || 50;
+              
+              // Explicitly set the target (this ensures enemy follows the player)
+              newEnemy.target = this.player;
+              
+              // Set aggro radius based on enemy type
+              newEnemy.aggroRadius = enemyData.type === 'boss' ? 250 : 150;
+              
+              // Set velocity for movement
+              if (newEnemy.body) {
+                newEnemy.body.setVelocity(
+                  enemyData.velocityX || 0,
+                  enemyData.velocityY || 0
+                );
+              }
+              
+              // Add to enemy array for tracking
+              this.enemies.push(newEnemy);
+              
+              // Setup collisions for new enemy with proper error handling
+              this.safeAddCollider(newEnemy, this.collisionLayer);
+              this.safeAddCollider(newEnemy, this.player, this.handlePlayerEnemyCollision, null, this);
+              
+              // Apply initial animation
+              if (newEnemy.isMoving) {
+                newEnemy.playWalkAnimation();
+              } else {
+                newEnemy.playIdleAnimation();
+              }
+            } catch (error) {
+              console.error(`Failed to create enemy ${enemyId}:`, error);
+            }
           }
-        } else {
-          // Create new enemy
-          console.log(`Creating new enemy: ${enemyId}, type: ${enemyData.type}`);
-          
-          // Determine the correct texture based on enemy type
-          let texture = 'skeleton1_idle';
-          if (enemyData.type === 'boss' || enemyData.type === 'vampire') {
-            texture = 'vampire_idle';
-          }
-          
-          // Create new enemy instance
-          const newEnemy = new Enemy(
-            this, 
-            enemyData.x, 
-            enemyData.y, 
-            texture,
-            enemyData.type || 'skeleton'
-          );
-          
-          // Set additional properties, ensuring ID consistency
-          newEnemy.enemyId = enemyId;
-          newEnemy.id = enemyId; // Set both ID properties for consistency
-          newEnemy.health = enemyData.health;
-          newEnemy.isDead = enemyData.isDead;
-          
-          // Handle dead state
-          if (enemyData.isDead) {
-            newEnemy.die();
-          }
-          
-          // Add to enemies array for tracking
-          this.enemies.push(newEnemy);
-          
-          // Set up collisions for new enemy
-          if (this.collisionLayer) {
-            this.physics.add.collider(newEnemy, this.collisionLayer);
-          }
-          
-          if (this.player) {
-            this.physics.add.collider(newEnemy, this.player, this.handlePlayerEnemyCollision, null, this);
-          }
+        } catch (error) {
+          console.error(`Error processing enemy ${enemyId}:`, error);
         }
       });
       
@@ -305,21 +392,11 @@ class GameScene extends Phaser.Scene {
     );
     
     if (existingEnemy) {
-      // Update enemy position with tween for smooth movement
-      this.tweens.add({
-        targets: existingEnemy,
-        x: enemyData.x,
-        y: enemyData.y,
-        duration: 100,
-        ease: 'Linear'
-      });
-      
-      existingEnemy.health = enemyData.health;
-      
-      // If the enemy died, play death animation
-      if (enemyData.isDead && !existingEnemy.isDead) {
-        existingEnemy.die();
-      }
+      // Update the enemy directly using the updateFromServer method
+      existingEnemy.updateFromServer(enemyData);
+    } else {
+      // If enemy doesn't exist yet, handle it through the bulk update method
+      this.handleEnemiesUpdated({[enemyData.id]: enemyData});
     }
   }
   
@@ -442,6 +519,83 @@ class GameScene extends Phaser.Scene {
     });
   }
 
+  // Handle offline mode enable
+  handleOfflineModeEnabled() {
+    console.log('Offline mode enabled, adjusting game experience');
+    this.events.emit('showMessage', 'Offline mode enabled. Multiplayer features disabled.');
+    
+    // We'll continue with the current game state but disable further sync attempts
+    this.isOfflineMode = true;
+    
+    // If we don't have a dungeon yet, generate one with a random seed
+    if (!this.dungeon) {
+      const offlineSeed = Math.floor(Math.random() * 1000000);
+      this.generateDungeon(offlineSeed);
+    }
+  }
+  
+  // Handle offline mode disable
+  handleOfflineModeDisabled() {
+    console.log('Connection restored, resuming multiplayer features');
+    this.events.emit('showMessage', 'Connection restored! Syncing game state...');
+    
+    this.isOfflineMode = false;
+    
+    // Request a full state sync to ensure we're caught up
+    this.time.delayedCall(300, () => {
+      multiplayerService.requestFullSync();
+    });
+  }
+  
+  // Perform a comprehensive sync of the entire game state
+  syncGameState() {
+    if (!this.isMultiplayer || !multiplayerService.getConnectionState().connected) return;
+    
+    // Only the host should send full game state
+    if (multiplayerService.isHost()) {
+      const gameState = {
+        seed: this.currentSeed,
+        players: {},
+        enemies: this.enemies,
+        items: this.items
+      };
+      
+      // Add local player
+      if (this.player) {
+        gameState.players[multiplayerService.getConnectionState().playerId] = {
+          id: multiplayerService.getConnectionState().playerId,
+          name: this.playerName,
+          x: this.player.x,
+          y: this.player.y,
+          health: this.player.health,
+          direction: this.player.direction,
+          animation: this.player.anims.currentAnim ? this.player.anims.currentAnim.key : 'player_idle_down',
+          isAttacking: this.player.isAttacking
+        };
+      }
+      
+      // Add other players
+      if (this.remotePlayerManager && this.remotePlayerManager.players) {
+        Object.keys(this.remotePlayerManager.players).forEach(playerId => {
+          const remotePlayer = this.remotePlayerManager.players[playerId];
+          gameState.players[playerId] = {
+            id: playerId,
+            name: remotePlayer.name || 'Player',
+            x: remotePlayer.x,
+            y: remotePlayer.y,
+            health: remotePlayer.health || 100,
+            direction: remotePlayer.direction || 'down',
+            animation: remotePlayer.anims.currentAnim ? remotePlayer.anims.currentAnim.key : 'player_idle_down',
+            isAttacking: remotePlayer.isAttacking || false
+          };
+        });
+      }
+      
+      // Send the complete game state to the server
+      multiplayerService.syncGameState(gameState);
+    }
+  }
+
   // Generate dungeon with optional seed for multiplayer sync
   generateDungeon(seed = null) {
     // Set a flag to track if we're retrying generation
@@ -480,6 +634,15 @@ class GameScene extends Phaser.Scene {
       
       // Always create a new player at the start position
       this.player = new Player(this, playerX, playerY, 'character');
+      
+      // Ensure the setInvulnerable method exists on the player
+      if (!this.player.setInvulnerable) {
+        this.player.setInvulnerable = function(value) {
+          this.isInvulnerable = value;
+          // Visual indicator for invulnerability
+          this.alpha = value ? 0.7 : 1;
+        };
+      }
       
       // Check if we have saved player data and restore it
       if (this.data.has('playerHealth')) {
@@ -527,19 +690,19 @@ class GameScene extends Phaser.Scene {
       this.placeExit();
       
       // Set up collisions
-      this.physics.add.collider(this.player, this.collisionLayer);
-      this.physics.add.collider(this.enemies, this.collisionLayer);
-      this.physics.add.collider(this.enemies, this.enemies); // Enemies collide with each other
-      this.physics.add.collider(this.player, this.enemies, this.handlePlayerEnemyCollision, null, this);
+      this.safeAddCollider(this.player, this.collisionLayer);
+      this.safeAddCollider(this.enemies, this.collisionLayer);
+      this.safeAddCollider(this.enemies, this.enemies); // Enemies collide with each other
+      this.safeAddCollider(this.player, this.enemies, this.handlePlayerEnemyCollision, null, this);
       
       // Set up item collection
-      this.physics.add.overlap(this.player, this.items, this.collectItem, null, this);
+      this.safeAddCollider(this.player, this.items, this.collectItem, null, this);
       
       // Set up trap activation
-      this.physics.add.overlap(this.player, this.traps, this.triggerTrap, null, this);
+      this.safeAddCollider(this.player, this.traps, this.triggerTrap, null, this);
       
       // Set up exit interaction
-      this.physics.add.overlap(this.player, this.exit, this.goToNextLevel, null, this);
+      this.safeAddCollider(this.player, this.exit, this.goToNextLevel, null, this);
       
       // Create minimap
       this.setupMinimap();
@@ -629,7 +792,7 @@ class GameScene extends Phaser.Scene {
     this.placeExit();
     
     // Set up basic collisions
-    this.physics.add.collider(this.player, this.collisionLayer);
+    this.safeAddCollider(this.player, this.collisionLayer);
     
     // Create minimap
     this.setupMinimap();
@@ -650,11 +813,11 @@ class GameScene extends Phaser.Scene {
       this.player.update();
       
       // In multiplayer mode, send position updates to server at intervals
-      if (this.isMultiplayer && multiplayerService.getConnectionState().connected) {
+      if (this.isMultiplayer && multiplayerService.getConnectionState().connected && !this.isOfflineMode) {
         if (time - this.lastPositionUpdate > this.positionUpdateInterval) {
           this.lastPositionUpdate = time;
           
-          // Only send updates if player has moved
+          // Only send updates if player has moved or changed animation
           if (this.player.body.velocity.x !== 0 || this.player.body.velocity.y !== 0 || 
               this.player.isAttacking || this.player.previousAnimation !== this.player.currentAnimation) {
             
@@ -667,6 +830,30 @@ class GameScene extends Phaser.Scene {
             
             // Store current animation for change detection
             this.player.previousAnimation = this.player.currentAnimation;
+          }
+        }
+        
+        // Perform full sync at intervals (only if we're the host)
+        if (this.syncTimers && multiplayerService.isHost()) {
+          // Quick sync for enemies and items
+          if (time - this.syncTimers.lastQuickSync > this.syncTimers.quickSyncInterval) {
+            this.syncTimers.lastQuickSync = time;
+            
+            // Sync enemies
+            if (this.enemies && this.enemies.length > 0) {
+              multiplayerService.syncEnemies(this.enemies);
+            }
+            
+            // Sync items
+            if (this.items && this.items.getChildren && this.items.getChildren().length > 0) {
+              multiplayerService.syncItems(this.items);
+            }
+          }
+          
+          // Full comprehensive sync less frequently
+          if (time - this.syncTimers.lastFullSync > this.syncTimers.fullSyncInterval) {
+            this.syncTimers.lastFullSync = time;
+            this.syncGameState();
           }
         }
       }
@@ -812,28 +999,23 @@ class GameScene extends Phaser.Scene {
     floorLayer.fill(-1);
     this.wallLayer.fill(-1);
     
-    // Tile indices based on the actual Dungeon_Tileset.png layout
+    // Tile indices based on the exact arrangement in Dungeon_Tileset.png
     const TILES = {
-      // Floor tiles - CORRECTED INDICES
-      FLOOR: 6, // Basic floor tile
-      FLOOR_ALT: 7, // Alternate floor tile for variety
-      
-      // Wall tiles
+      FLOOR: 6,      // Basic floor
+      FLOOR_ALT: 7,  // Alternate floor for variety
       WALL: {
-        TOP_LEFT: 3,     // Top left corner wall
-        TOP: 4,          // Top wall
-        TOP_RIGHT: 5,    // Top right corner wall
-        LEFT: 12,        // Left wall
-        RIGHT: 14,       // Right wall
-        BOTTOM_LEFT: 21, // Bottom left corner wall
-        BOTTOM: 22,      // Bottom wall
-        BOTTOM_RIGHT: 23, // Bottom right corner wall
-        
-        // Inner corners
-        INNER_TOP_LEFT: 13,     // Inner top left corner
-        INNER_TOP_RIGHT: 15,    // Inner top right corner
-        INNER_BOTTOM_LEFT: 31,  // Inner bottom left corner
-        INNER_BOTTOM_RIGHT: 33  // Inner bottom right corner
+        TOP: 1,      // Top wall (facing down)
+        RIGHT: 0,    // Right wall (facing left)
+        BOTTOM: 3,   // Bottom wall (facing up) 
+        LEFT: 2,     // Left wall (facing right)
+        CORNER_TOP_RIGHT: 4,    // Top right outer corner
+        CORNER_TOP_LEFT: 5,     // Top left outer corner
+        CORNER_BOTTOM_RIGHT: 8, // Bottom right outer corner
+        CORNER_BOTTOM_LEFT: 9,  // Bottom left outer corner
+        INNER_TOP_RIGHT: 11,    // Inner top right corner
+        INNER_TOP_LEFT: 12,     // Inner top left corner
+        INNER_BOTTOM_RIGHT: 13, // Inner bottom right corner
+        INNER_BOTTOM_LEFT: 14   // Inner bottom left corner
       },
       
       // Special floor tiles for different room types
@@ -846,6 +1028,14 @@ class GameScene extends Phaser.Scene {
     // Place floor tiles in rooms
     const rooms = this.dungeon.rooms;
     const corridors = this.dungeon.corridors;
+    
+    // Use the dungeon's seed to create consistent decoration
+    // Create a simple seeded random function based on the dungeon seed
+    let decorSeed = this.dungeon.seed || Math.floor(Math.random() * 1000000);
+    const seededRandom = function() {
+      decorSeed = (decorSeed * 9301 + 49297) % 233280;
+      return decorSeed / 233280;
+    };
     
     // Place floor tiles in rooms
     rooms.forEach(room => {
@@ -866,7 +1056,7 @@ class GameScene extends Phaser.Scene {
       for (let x = room.x; x < room.x + room.width; x++) {
         for (let y = room.y; y < room.y + room.height; y++) {
           // Add some variety to floor tiles (10% chance for alternate tile)
-          const tileToUse = Math.random() > 0.1 ? floorTile : TILES.FLOOR_ALT;
+          const tileToUse = seededRandom() > 0.1 ? floorTile : TILES.FLOOR_ALT;
           floorLayer.putTileAt(tileToUse, x, y);
         }
       }
@@ -874,25 +1064,9 @@ class GameScene extends Phaser.Scene {
     
     // Place floor tiles in corridors
     corridors.forEach(corridor => {
-      const isHorizontal = corridor.startY === corridor.endY;
-      const isVertical = corridor.startX === corridor.endX;
-      
-      if (isHorizontal) {
-        const y = corridor.startY;
-        for (let x = Math.min(corridor.startX, corridor.endX); x <= Math.max(corridor.startX, corridor.endX); x++) {
-          floorLayer.putTileAt(TILES.FLOOR, x, y);
-        }
-      } else if (isVertical) {
-        const x = corridor.startX;
+      for (let x = Math.min(corridor.startX, corridor.endX); x <= Math.max(corridor.startX, corridor.endX); x++) {
         for (let y = Math.min(corridor.startY, corridor.endY); y <= Math.max(corridor.startY, corridor.endY); y++) {
           floorLayer.putTileAt(TILES.FLOOR, x, y);
-        }
-      } else {
-        // Handle diagonal corridors if they exist
-        for (let x = Math.min(corridor.startX, corridor.endX); x <= Math.max(corridor.startX, corridor.endX); x++) {
-          for (let y = Math.min(corridor.startY, corridor.endY); y <= Math.max(corridor.startY, corridor.endY); y++) {
-            floorLayer.putTileAt(TILES.FLOOR, x, y);
-          }
         }
       }
     });
@@ -928,9 +1102,160 @@ class GameScene extends Phaser.Scene {
             (y < this.dungeon.height - 1 && x < this.dungeon.width - 1 && wallGrid[y+1][x+1] === 0);
           
           if (hasFloorNeighbor) {
-            // For now, use a simple generic wall tile
-            // We'll enhance this for aesthetic walls in a future update
-            this.wallLayer.putTileAt(TILES.WALL.TOP, x, y);
+            // First get all neighbor information
+            const floorAbove = y > 0 && wallGrid[y-1][x] === 0;
+            const floorBelow = y < this.dungeon.height - 1 && wallGrid[y+1][x] === 0;
+            const floorLeft = x > 0 && wallGrid[y][x-1] === 0;
+            const floorRight = x < this.dungeon.width - 1 && wallGrid[y][x+1] === 0;
+            
+            // Diagonal floor tiles
+            const floorTopLeft = y > 0 && x > 0 && wallGrid[y-1][x-1] === 0;
+            const floorTopRight = y > 0 && x < this.dungeon.width - 1 && wallGrid[y-1][x+1] === 0;
+            const floorBottomLeft = y < this.dungeon.height - 1 && x > 0 && wallGrid[y+1][x-1] === 0;
+            const floorBottomRight = y < this.dungeon.height - 1 && x < this.dungeon.width - 1 && wallGrid[y+1][x+1] === 0;
+
+            // Define each possible wall configuration separately
+            let tileToUse = TILES.WALL.TOP; // Default wall tile
+            
+            // Single floor neighbors
+            if (floorBelow && !floorAbove && !floorLeft && !floorRight) {
+              tileToUse = TILES.WALL.TOP;
+            } 
+            else if (floorAbove && !floorBelow && !floorLeft && !floorRight) {
+              tileToUse = TILES.WALL.BOTTOM;
+            }
+            else if (floorLeft && !floorRight && !floorAbove && !floorBelow) {
+              tileToUse = TILES.WALL.RIGHT;
+            }
+            else if (floorRight && !floorLeft && !floorAbove && !floorBelow) {
+              tileToUse = TILES.WALL.LEFT;
+            }
+            
+            // Two adjacent floor neighbors - straight walls
+            else if (floorAbove && floorBelow && !floorLeft && !floorRight) {
+              tileToUse = TILES.WALL.LEFT;  // Vertical wall
+            }
+            else if (floorLeft && floorRight && !floorAbove && !floorBelow) {
+              tileToUse = TILES.WALL.TOP;   // Horizontal wall
+            }
+            
+            // Two floor neighbors - outer corners
+            // Corner cases need careful detection for proper connections
+            else if (floorBelow && floorRight && !floorAbove && !floorLeft) {
+              // For outer corner, we need to check if there's a floor at the diagonal
+              if (!floorBottomRight) {
+                tileToUse = TILES.WALL.CORNER_TOP_LEFT;
+              } else {
+                // If there is a floor at diagonal, we need a different tile based on context
+                // Check surrounding tiles to determine best fit
+                tileToUse = TILES.WALL.TOP; // Default to horizontal wall if uncertain
+              }
+            }
+            else if (floorBelow && floorLeft && !floorAbove && !floorRight) {
+              if (!floorBottomLeft) {
+                tileToUse = TILES.WALL.CORNER_TOP_RIGHT;
+              } else {
+                tileToUse = TILES.WALL.TOP; // Default to horizontal wall if uncertain
+              }
+            }
+            else if (floorAbove && floorRight && !floorBelow && !floorLeft) {
+              if (!floorTopRight) {
+                tileToUse = TILES.WALL.CORNER_BOTTOM_LEFT;
+              } else {
+                tileToUse = TILES.WALL.LEFT; // Default to vertical wall if uncertain
+              }
+            }
+            else if (floorAbove && floorLeft && !floorBelow && !floorRight) {
+              if (!floorTopLeft) {
+                tileToUse = TILES.WALL.CORNER_BOTTOM_RIGHT;
+              } else {
+                tileToUse = TILES.WALL.RIGHT; // Default to vertical wall if uncertain
+              }
+            }
+            
+            // Inner corners - exact pattern matching for reliable detection
+            else if (!floorAbove && !floorRight && floorTopRight) {
+              tileToUse = TILES.WALL.INNER_BOTTOM_LEFT;
+            }
+            else if (!floorAbove && !floorLeft && floorTopLeft) {
+              tileToUse = TILES.WALL.INNER_BOTTOM_RIGHT;
+            }
+            else if (!floorBelow && !floorRight && floorBottomRight) {
+              tileToUse = TILES.WALL.INNER_TOP_LEFT;
+            }
+            else if (!floorBelow && !floorLeft && floorBottomLeft) {
+              tileToUse = TILES.WALL.INNER_TOP_RIGHT;
+            }
+            
+            // Three floor neighbors - T-junctions
+            else if (floorLeft && floorRight && floorBelow && !floorAbove) {
+                tileToUse = TILES.WALL.TOP;
+            }
+            else if (floorLeft && floorRight && floorAbove && !floorBelow) {
+                tileToUse = TILES.WALL.BOTTOM;
+            }
+            else if (floorAbove && floorBelow && floorRight && !floorLeft) {
+                tileToUse = TILES.WALL.LEFT;
+            }
+            else if (floorAbove && floorBelow && floorLeft && !floorRight) {
+                tileToUse = TILES.WALL.RIGHT;
+            }
+            
+            // Diagonal-only connections (rare case)
+            else if (!floorAbove && !floorBelow && !floorLeft && !floorRight) {
+              // If only diagonal floors, use inner corner that points away from floor
+              if (floorTopLeft && !floorTopRight && !floorBottomLeft && !floorBottomRight) {
+                tileToUse = TILES.WALL.INNER_BOTTOM_RIGHT;
+              }
+              else if (!floorTopLeft && floorTopRight && !floorBottomLeft && !floorBottomRight) {
+                tileToUse = TILES.WALL.INNER_BOTTOM_LEFT;
+              }
+              else if (!floorTopLeft && !floorTopRight && floorBottomLeft && !floorBottomRight) {
+                tileToUse = TILES.WALL.INNER_TOP_RIGHT;
+              }
+              else if (!floorTopLeft && !floorTopRight && !floorBottomLeft && floorBottomRight) {
+                tileToUse = TILES.WALL.INNER_TOP_LEFT;
+              }
+              else {
+                tileToUse = TILES.WALL.TOP; // Default if multiple diagonal floors
+              }
+            }
+            
+            // Four floor neighbors - surrounded wall
+            else if (floorAbove && floorBelow && floorLeft && floorRight) {
+              // Choose based on diagonal floors if any are missing
+              if (!floorTopLeft) {
+                tileToUse = TILES.WALL.INNER_BOTTOM_RIGHT;
+              }
+              else if (!floorTopRight) {
+                tileToUse = TILES.WALL.INNER_BOTTOM_LEFT;
+              }
+              else if (!floorBottomLeft) {
+                tileToUse = TILES.WALL.INNER_TOP_RIGHT;
+              }
+              else if (!floorBottomRight) {
+                tileToUse = TILES.WALL.INNER_TOP_LEFT;
+              }
+              else {
+                tileToUse = TILES.WALL.TOP; // Completely surrounded, use default
+              }
+            }
+            
+            // Default fallback in case of odd configurations
+            else {
+              // Check for the most important direction and use that
+              if (floorBelow) {
+                tileToUse = TILES.WALL.TOP;
+              } else if (floorRight) {
+                tileToUse = TILES.WALL.LEFT;
+              } else if (floorLeft) {
+                tileToUse = TILES.WALL.RIGHT;
+              } else if (floorAbove) {
+                tileToUse = TILES.WALL.BOTTOM;
+              }
+            }
+
+            this.wallLayer.putTileAt(tileToUse, x, y);
           }
         }
       }
@@ -944,14 +1269,14 @@ class GameScene extends Phaser.Scene {
       // Add decorations with some probability (avoiding edges)
       for (let x = room.x + 1; x < room.x + room.width - 1; x++) {
         for (let y = room.y + 1; y < room.y + room.height - 1; y++) {
-          if (Math.random() > 0.95) {
+          if (seededRandom() > 0.95) {
             // Random decorative object - these are all just example indices
-            let decorTile = 16 + Math.floor(Math.random() * 4);
+            let decorTile = 16 + Math.floor(seededRandom() * 4);
             
             if (room.type === 'boss') {
-              decorTile = 20 + Math.floor(Math.random() * 3);
+              decorTile = 20 + Math.floor(seededRandom() * 3);
             } else if (room.type === 'treasure') {
-              decorTile = 24 + Math.floor(Math.random() * 3);
+              decorTile = 23 + Math.floor(seededRandom() * 3);
             }
             
             this.decorationLayer.putTileAt(decorTile, x, y);
@@ -960,11 +1285,14 @@ class GameScene extends Phaser.Scene {
       }
     });
     
-    // Set collision on the wall layer
+    // Set collision on wall layer
     this.wallLayer.setCollisionByExclusion([-1]);
     this.collisionLayer = this.wallLayer;
     
-    return this.map;
+    // Set depth ordering
+    floorLayer.setDepth(0);
+    this.decorationLayer.setDepth(1);
+    this.wallLayer.setDepth(5);
   }
   
   spawnEnemies() {
@@ -983,10 +1311,63 @@ class GameScene extends Phaser.Scene {
         enemyCount = 1; // 1 boss enemy for boss room
       }
       
+      // Safety check - ensure we don't spawn more enemies than can fit in the room
+      const maxEnemiesForRoom = Math.max(1, Math.floor((room.width - 2) * (room.height - 2) / 4));
+      enemyCount = Math.min(enemyCount, maxEnemiesForRoom);
+
       for (let j = 0; j < enemyCount; j++) {
-        // Calculate a position within the room
-        const x = Math.floor(room.x + 1 + Math.random() * (room.width - 2)) * 16;
-        const y = Math.floor(room.y + 1 + Math.random() * (room.height - 2)) * 16;
+        // Calculate a position within the room with safer boundaries
+        // Leave a 1-tile buffer from the walls to prevent spawning in walls
+        let x, y;
+        let validPosition = false;
+        let attempts = 0;
+        const maxAttempts = 10; // Limit attempts to find a valid position
+        
+        while (!validPosition && attempts < maxAttempts) {
+          // Use a buffer of 2 tiles from the edges for safer positioning
+          const minX = room.x + 2;
+          const maxX = room.x + room.width - 2;
+          const minY = room.y + 2;
+          const maxY = room.y + room.height - 2;
+          
+          // Generate potential position
+          const tileX = Math.floor(minX + Math.random() * (maxX - minX));
+          const tileY = Math.floor(minY + Math.random() * (maxY - minY));
+          
+          // Convert to pixel coordinates (center of tile)
+          x = tileX * 16 + 8;
+          y = tileY * 16 + 8;
+          
+          // Check if this position is valid (not colliding with walls)
+          validPosition = true; // Assume valid unless proven otherwise
+          
+          // If we have access to the collision layer, check if the tile is walkable
+          if (this.collisionLayer) {
+            const tile = this.collisionLayer.getTileAtWorldXY(x, y);
+            if (tile && tile.collides) {
+              validPosition = false;
+            }
+          }
+          
+          // Avoid spawning too close to other enemies
+          if (validPosition && this.enemies.length > 0) {
+            for (const otherEnemy of this.enemies) {
+              const dist = Phaser.Math.Distance.Between(x, y, otherEnemy.x, otherEnemy.y);
+              if (dist < 32) { // Minimum 2 tiles distance between enemies
+                validPosition = false;
+                break;
+              }
+            }
+          }
+          
+          attempts++;
+        }
+        
+        // If we couldn't find a valid position after max attempts, skip this enemy
+        if (!validPosition) {
+          console.warn(`Couldn't find valid position for enemy in room ${i} after ${maxAttempts} attempts`);
+          continue;
+        }
         
         // Determine enemy type
         let enemyType = 'skeleton';
@@ -1139,10 +1520,15 @@ class GameScene extends Phaser.Scene {
       this.screenShake(0.02, 250);
       
       // Make player invulnerable for a short time
-      player.setInvulnerable(true);
+      // Set property directly if method doesn't work
+      player.isInvulnerable = true;
+      player.alpha = 0.7; // Visual indicator for invulnerability
+      
       this.time.delayedCall(1000, () => {
         if (player.active) { // Check if player still exists
-          player.setInvulnerable(false);
+          // Reset invulnerability
+          player.isInvulnerable = false;
+          player.alpha = 1;
         }
       });
       
@@ -1197,15 +1583,60 @@ class GameScene extends Phaser.Scene {
       // Notify the UI scene
       this.events.emit('showMessage', lootMessage);
       
+      // In multiplayer, notify other clients about this item change
+      if (this.isMultiplayer && multiplayerService.getConnectionState().connected) {
+        // Make sure item has an ID
+        const itemId = item.id || item.itemId || `item_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+        if (!item.id && !item.itemId) {
+          item.id = itemId;
+          item.itemId = itemId;
+        }
+        
+        // Notify server about the chest being opened
+        multiplayerService.updateItem({
+          id: itemId,
+          type: 'chest',
+          x: item.x,
+          y: item.y,
+          isOpen: true,
+          collected: false,
+          quality: item.quality || 'normal'
+        });
+      }
+      
     } else if (item.itemType === 'coin') {
       // Collect gold coin
       player.addGold(item.value);
+      
+      // Synchronize with server in multiplayer
+      if (this.isMultiplayer && multiplayerService.getConnectionState().connected) {
+        const itemId = item.id || item.itemId || `coin_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+        multiplayerService.pickupItem({
+          id: itemId,
+          type: 'coin',
+          collected: true
+        });
+      }
+      
+      // Destroy the coin
       item.destroy();
       
     } else if (item.itemType === 'health_potion') {
       // Collect health potion
       player.addToInventory('health_potion');
       this.events.emit('showMessage', 'Picked up a health potion!');
+      
+      // Synchronize with server in multiplayer
+      if (this.isMultiplayer && multiplayerService.getConnectionState().connected) {
+        const itemId = item.id || item.itemId || `potion_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+        multiplayerService.pickupItem({
+          id: itemId,
+          type: 'health_potion',
+          collected: true
+        });
+      }
+      
+      // Destroy the potion
       item.destroy();
     }
   }
@@ -1633,6 +2064,65 @@ class GameScene extends Phaser.Scene {
     const roomCenterX = (room.x + room.width / 2) * 16;
     const roomCenterY = (room.y + room.height / 2) * 16;
     this.focusCamera(roomCenterX, roomCenterY, 1, duration);
+  }
+
+  // Safe method for adding colliders with collision layer validation
+  safeAddCollider(object1, object2, callback = null, processCallback = null, context = null) {
+    // Check if both objects exist and are valid
+    if (!object1 || !object2) {
+      console.warn('Attempted to add collider with undefined objects');
+      
+      // Store pending collider if collision layer isn't ready yet
+      if (this.collisionCheckSafety && !this.collisionCheckSafety.isReady) {
+        this.collisionCheckSafety.pendingColliders.push({
+          object1, object2, callback, processCallback, context
+        });
+        return null; // Return null instead of an invalid collider
+      }
+      return null;
+    }
+    
+    // Additional check specifically for tilemaps to prevent the tileWidth error
+    if ((object1 === this.collisionLayer || object2 === this.collisionLayer) && 
+        (!this.map || !this.map.tileWidth)) {
+      console.warn('Attempted to add collider with incomplete tilemap');
+      
+      // Store for later when the map is ready
+      if (this.collisionCheckSafety) {
+        this.collisionCheckSafety.pendingColliders.push({
+          object1, object2, callback, processCallback, context
+        });
+        console.log('Added pending collider for when tilemap is ready');
+        return null;
+      }
+      return null;
+    }
+    
+    return this.physics.add.collider(object1, object2, callback, processCallback, context);
+  }
+
+  // Apply all pending colliders when collision layer is ready
+  applyPendingColliders() {
+    if (!this.collisionCheckSafety || !this.collisionCheckSafety.pendingColliders) {
+      return;
+    }
+    
+    // Apply pending colliders
+    this.collisionCheckSafety.pendingColliders.forEach(colliderData => {
+      if (colliderData.object1 && colliderData.object2) {
+        this.physics.add.collider(
+          colliderData.object1, 
+          colliderData.object2, 
+          colliderData.callback, 
+          colliderData.processCallback, 
+          colliderData.context
+        );
+      }
+    });
+    
+    // Clear pending colliders
+    this.collisionCheckSafety.pendingColliders = [];
+    this.collisionCheckSafety.isReady = true;
   }
 }
 
