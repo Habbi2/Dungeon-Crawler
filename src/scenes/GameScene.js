@@ -122,6 +122,13 @@ class GameScene extends Phaser.Scene {
     multiplayerService.on('disconnect', this.handleDisconnect.bind(this));
     multiplayerService.on('dungeonSeed', this.handleDungeonSeed.bind(this));
     
+    // Set up enemy and item synchronization handlers
+    multiplayerService.on('enemiesUpdated', this.handleEnemiesUpdated.bind(this));
+    multiplayerService.on('enemyUpdated', this.handleEnemyUpdated.bind(this));
+    multiplayerService.on('itemsUpdated', this.handleItemsUpdated.bind(this));
+    multiplayerService.on('itemUpdated', this.handleItemUpdated.bind(this));
+    multiplayerService.on('itemRemoved', this.handleItemRemoved.bind(this));
+    
     // Initialize with player data
     multiplayerService.init(this, {
       name: this.playerName,
@@ -134,6 +141,12 @@ class GameScene extends Phaser.Scene {
   handleConnect() {
     console.log('Connected to game server!');
     this.events.emit('showMessage', 'Connected to multiplayer server!');
+    
+    // Start the regular sync intervals for enemies, items and other game elements
+    multiplayerService.startSyncIntervals(this);
+    
+    // First time connection, request full state to ensure we're in sync
+    multiplayerService.requestFullSync();
   }
 
   // Handle disconnection from server
@@ -146,11 +159,287 @@ class GameScene extends Phaser.Scene {
   handleDungeonSeed(seed) {
     console.log('Received dungeon seed:', seed);
     
-    // Only generate the dungeon once per seed to prevent multiple generation
-    if (!this.currentSeed || this.currentSeed !== seed) {
-      this.currentSeed = seed;
-      this.generateDungeon(seed);
+    // Clear any existing dungeon before generating a new one
+    if (this.map) {
+      this.map.destroy();
     }
+    
+    // Clear any existing objects before recreating the level
+    if (this.enemies) {
+      this.enemies.forEach(enemy => {
+        if (enemy && enemy.destroy) enemy.destroy();
+      });
+      this.enemies = [];
+    }
+    
+    if (this.items) {
+      if (this.items.getChildren) {
+        this.items.getChildren().forEach(item => {
+          if (item && item.destroy) item.destroy();
+        });
+      }
+    }
+    
+    if (this.traps) {
+      if (this.traps.getChildren) {
+        this.traps.getChildren().forEach(trap => {
+          if (trap && trap.destroy) trap.destroy();
+        });
+      }
+    }
+    
+    if (this.exit && this.exit.destroy) {
+      this.exit.destroy();
+    }
+    
+    // Use the received seed for dungeon generation to ensure consistency
+    this.currentSeed = seed;
+    this.generateDungeon(seed);
+    
+    // Request a full sync after dungeon generation to ensure all game objects are in sync
+    if (this.isMultiplayer && multiplayerService.getConnectionState().connected) {
+      multiplayerService.requestFullSync();
+    }
+    
+    console.log('Dungeon regenerated with seed:', seed);
+  }
+
+  // Handle server-provided enemy updates
+  handleEnemiesUpdated(enemies) {
+    if (!this.isMultiplayer) return;
+    
+    console.log('Received enemy updates from server:', enemies);
+    
+    // If we're not the host, update or create enemies
+    if (!multiplayerService.isHost()) {
+      // Keep track of which enemies we've updated
+      const updatedEnemies = new Set();
+      
+      // Update or create enemies from the server data
+      Object.keys(enemies).forEach(enemyId => {
+        const enemyData = enemies[enemyId];
+        updatedEnemies.add(enemyId);
+        
+        // Find existing enemy with this ID
+        const existingEnemy = this.enemies.find(e => e.id === enemyId || e.enemyId === enemyId);
+        
+        if (existingEnemy) {
+          // Update existing enemy with smooth transition
+          this.tweens.add({
+            targets: existingEnemy,
+            x: enemyData.x,
+            y: enemyData.y,
+            duration: 100,
+            ease: 'Linear'
+          });
+          
+          existingEnemy.health = enemyData.health;
+          existingEnemy.isDead = enemyData.isDead;
+          
+          // Update animation state based on server data
+          if (enemyData.isDead && !existingEnemy.playedDeathAnim) {
+            existingEnemy.die();
+          }
+        } else {
+          // Create new enemy
+          console.log(`Creating new enemy: ${enemyId}, type: ${enemyData.type}`);
+          
+          // Determine the correct texture based on enemy type
+          let texture = 'skeleton1_idle';
+          if (enemyData.type === 'boss' || enemyData.type === 'vampire') {
+            texture = 'vampire_idle';
+          }
+          
+          // Create new enemy instance
+          const newEnemy = new Enemy(
+            this, 
+            enemyData.x, 
+            enemyData.y, 
+            texture,
+            enemyData.type || 'skeleton'
+          );
+          
+          // Set additional properties, ensuring ID consistency
+          newEnemy.enemyId = enemyId;
+          newEnemy.id = enemyId; // Set both ID properties for consistency
+          newEnemy.health = enemyData.health;
+          newEnemy.isDead = enemyData.isDead;
+          
+          // Handle dead state
+          if (enemyData.isDead) {
+            newEnemy.die();
+          }
+          
+          // Add to enemies array for tracking
+          this.enemies.push(newEnemy);
+          
+          // Set up collisions for new enemy
+          if (this.collisionLayer) {
+            this.physics.add.collider(newEnemy, this.collisionLayer);
+          }
+          
+          if (this.player) {
+            this.physics.add.collider(newEnemy, this.player, this.handlePlayerEnemyCollision, null, this);
+          }
+        }
+      });
+      
+      // Remove enemies that no longer exist on the server
+      this.enemies = this.enemies.filter(enemy => {
+        const enemyId = enemy.id || enemy.enemyId;
+        if (!updatedEnemies.has(enemyId) && enemyId) {
+          enemy.destroy();
+          return false;
+        }
+        return true;
+      });
+    }
+  }
+  
+  // Handle individual enemy update
+  handleEnemyUpdated(enemyData) {
+    if (!this.isMultiplayer || multiplayerService.isHost()) return;
+    
+    const existingEnemy = this.enemies.find(e => 
+      (e.id === enemyData.id || e.enemyId === enemyData.id)
+    );
+    
+    if (existingEnemy) {
+      // Update enemy position with tween for smooth movement
+      this.tweens.add({
+        targets: existingEnemy,
+        x: enemyData.x,
+        y: enemyData.y,
+        duration: 100,
+        ease: 'Linear'
+      });
+      
+      existingEnemy.health = enemyData.health;
+      
+      // If the enemy died, play death animation
+      if (enemyData.isDead && !existingEnemy.isDead) {
+        existingEnemy.die();
+      }
+    }
+  }
+  
+  // Handle server-provided item updates
+  handleItemsUpdated(items) {
+    if (!this.isMultiplayer) return;
+    
+    console.log('Received item updates from server:', items);
+    
+    // If we're not the host, update the items
+    if (!multiplayerService.isHost()) {
+      // Track which items we've updated
+      const updatedItems = new Set();
+      
+      // Update or create items from server data
+      Object.keys(items).forEach(itemId => {
+        const itemData = items[itemId];
+        updatedItems.add(itemId);
+        
+        // Find existing item
+        let existingItem = null;
+        this.items.getChildren().forEach(item => {
+          if (item.id === itemId || item.itemId === itemId) {
+            existingItem = item;
+          }
+        });
+        
+        if (existingItem) {
+          // Update existing item
+          existingItem.x = itemData.x;
+          existingItem.y = itemData.y;
+          
+          // Handle collected items
+          if (itemData.collected && !existingItem.collected) {
+            existingItem.collected = true;
+            existingItem.destroy();
+          }
+        } else if (!itemData.collected) {
+          // Create new item if it's not collected
+          let newItem;
+          
+          switch (itemData.type) {
+            case 'chest':
+              newItem = this.physics.add.sprite(itemData.x, itemData.y, 'chest', 0);
+              newItem.itemType = 'chest';
+              newItem.isOpen = false;
+              newItem.quality = itemData.quality || 'normal';
+              break;
+              
+            case 'coin':
+              newItem = this.physics.add.sprite(itemData.x, itemData.y, 'coin', 0);
+              newItem.anims.play('coin_spin', true);
+              newItem.itemType = 'coin';
+              newItem.value = itemData.value || 1;
+              break;
+              
+            case 'health_potion':
+              newItem = this.physics.add.sprite(itemData.x, itemData.y, 'health_potion', 0);
+              newItem.itemType = 'health_potion';
+              break;
+          }
+          
+          if (newItem) {
+            newItem.itemId = itemId;
+            this.items.add(newItem);
+          }
+        }
+      });
+      
+      // Remove items that no longer exist on the server
+      this.items.getChildren().forEach(item => {
+        const itemId = item.id || item.itemId;
+        if (!updatedItems.has(itemId) && itemId) {
+          item.destroy();
+        }
+      });
+    }
+  }
+  
+  // Handle individual item update
+  handleItemUpdated(itemData) {
+    if (!this.isMultiplayer || multiplayerService.isHost()) return;
+    
+    // Find the corresponding item
+    let matchedItem = null;
+    this.items.getChildren().forEach(item => {
+      if (item.id === itemData.id || item.itemId === itemData.id) {
+        matchedItem = item;
+      }
+    });
+    
+    if (matchedItem) {
+      // Update position
+      matchedItem.x = itemData.x;
+      matchedItem.y = itemData.y;
+      
+      // Handle chest opening
+      if (itemData.type === 'chest' && itemData.isOpen && !matchedItem.isOpen) {
+        matchedItem.isOpen = true;
+        matchedItem.anims.play('chest_open');
+      }
+      
+      // Handle collected state
+      if (itemData.collected && !matchedItem.collected) {
+        matchedItem.collected = true;
+        matchedItem.destroy();
+      }
+    }
+  }
+  
+  // Handle item removal
+  handleItemRemoved(itemData) {
+    if (!this.isMultiplayer || multiplayerService.isHost()) return;
+    
+    // Find and remove the item
+    this.items.getChildren().forEach(item => {
+      if (item.id === itemData.id || item.itemId === itemData.id) {
+        item.destroy();
+      }
+    });
   }
 
   // Generate dungeon with optional seed for multiplayer sync

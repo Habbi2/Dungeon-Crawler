@@ -1,37 +1,57 @@
 import Phaser from 'phaser';
 
 class Enemy extends Phaser.Physics.Arcade.Sprite {
-  constructor(scene, x, y, texture, enemyType) {
-    super(scene, x, y, texture);
+  constructor(scene, x, y, texture, enemyType = 'skeleton') {
+    super(scene, x, y, texture, 0);
     
     this.scene = scene;
     this.enemyType = enemyType;
-    this.health = 30;
-    this.maxHealth = 30;
-    this.attackPower = 5;
-    this.speed = 40;
-    this.aggroRange = 150;
-    this.isDead = false;
+    this.health = enemyType === 'boss' ? 100 : (enemyType === 'vampire' ? 40 : 20);
+    this.maxHealth = this.health;
+    this.attackPower = enemyType === 'boss' ? 20 : (enemyType === 'vampire' ? 15 : 10);
+    this.speed = enemyType === 'boss' ? 60 : (enemyType === 'vampire' ? 80 : 70);
+    this.aggro = false;
+    this.aggroRadius = enemyType === 'boss' ? 250 : 150;
+    this.attackRadius = 20;
+    this.attackCooldown = 1000;
     this.lastAttackTime = 0;
-    this.attackCooldown = 1500; // 1.5 seconds between attacks
+    this.isDead = false;
+    this.playedDeathAnim = false;
+    this.direction = 'down';
+    this.state = 'idle';
+    this.lastStateChange = 0;
+    this.stateChangeCooldown = 1500;
     
-    // Boss-specific properties
-    this.bossNearPlayerThreshold = 200; // Distance to trigger boss warning
-    this.bossNearNotified = false; // Track if we've already shown the warning
-    this.bossSpecialAttackRange = 100; // Range for special attack
-    this.bossLastSpecialAttack = 0; // Timing for special attacks
-    this.bossSpecialAttackCooldown = 5000; // 5 seconds between special attacks
+    // Create unique ID for multiplayer tracking - use consistent ID generation
+    // Use a deterministic ID format that will be the same across clients
+    // Include position in the ID to ensure uniqueness based on spawn location
+    this.enemyId = `enemy_${enemyType}_${Math.floor(x)}_${Math.floor(y)}`;
+    // Also set the id property for consistent reference
+    this.id = this.enemyId;
     
-    // Configure based on enemy type
-    this.configureEnemy();
+    // Create a simple patrol pattern for this enemy
+    this.patrolPoints = [
+      new Phaser.Math.Vector2(x, y),
+      new Phaser.Math.Vector2(x + Phaser.Math.Between(-100, 100), y + Phaser.Math.Between(-100, 100))
+    ];
+    this.currentPatrolIndex = 0;
     
-    // Add to scene and enable physics
+    // Add to scene and physics
     scene.add.existing(this);
     scene.physics.add.existing(this);
     
-    // Configure physics body
-    this.body.setSize(16, 16);
-    this.body.setOffset(8, 16);
+    // Configure physics
+    this.body.setSize(12, 12);
+    this.body.setOffset(2, 4);
+    
+    // Set animation based on type
+    if (enemyType === 'boss') {
+      this.anims.play('vampire_idle');
+    } else if (enemyType === 'vampire') {
+      this.anims.play('vampire_idle');
+    } else {
+      this.anims.play('skeleton1_idle');
+    }
     
     // Add health bar
     this.createHealthBar();

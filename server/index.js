@@ -176,6 +176,29 @@ io.on('connection', (socket) => {
     }
   });
   
+  // Handle enemy synchronization from host player
+  socket.on('syncEnemies', (enemiesData) => {
+    if (players[socket.id] && players[socket.id].room) {
+      const room = players[socket.id].room;
+      
+      // Update all enemies in the room with the data from host
+      if (rooms[room]) {
+        // Replace the entire enemies object instead of updating individually
+        rooms[room].enemies = {};
+        
+        // Process each enemy and store by ID
+        enemiesData.forEach(enemyData => {
+          if (enemyData.id) {
+            rooms[room].enemies[enemyData.id] = enemyData;
+          }
+        });
+        
+        // Broadcast updates to all clients except sender
+        socket.to(room).emit('currentEnemies', rooms[room].enemies);
+      }
+    }
+  });
+  
   // Item updates (pickup, spawn, etc)
   socket.on('itemUpdate', (itemData) => {
     if (players[socket.id] && players[socket.id].room) {

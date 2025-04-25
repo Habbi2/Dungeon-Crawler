@@ -62,6 +62,14 @@ class RemotePlayerManager {
    * @param {Object} playerInfo - Player information
    */
   handlePlayerJoined(playerInfo) {
+    // Skip if this is our own ID or the player already exists
+    if (playerInfo.id === multiplayerService.getConnectionState().playerId || this.players[playerInfo.id]) {
+      console.log(`Skipping duplicate player creation: ${playerInfo.id}`);
+      return;
+    }
+    
+    console.log(`Creating new remote player: ${playerInfo.id} (${playerInfo.name})`);
+    
     // Create player sprite
     const player = this.scene.physics.add.sprite(
       playerInfo.x, 

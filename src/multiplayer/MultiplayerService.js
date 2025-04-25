@@ -31,6 +31,28 @@ class MultiplayerService {
     
     // Periodic reconnection check when in offline mode
     this.offlineModeReconnectTimer = null;
+    
+    // Sync settings
+    this.syncConfig = {
+      updateRate: 100,              // How often to send position updates (ms)
+      interpolationDelay: 100,      // Buffer time for interpolation (ms)
+      maxPredictionSteps: 10,       // Maximum prediction steps
+      snapDistance: 100,            // Distance at which to snap instead of interpolate
+      positionBuffer: [],           // Buffer for position interpolation
+      lastUpdateTime: 0,            // Last time an update was sent
+      enemySyncRate: 200,           // How often to sync enemy states (ms)
+      itemSyncRate: 500,            // How often to sync item states (ms)
+      fullSyncRate: 5000            // How often to do a full state sync (ms)
+    };
+    
+    // Timer for regular position updates
+    this.updateTimer = null;
+    
+    // Timer for enemy synchronization
+    this.enemySyncTimer = null;
+    
+    // Timer for item synchronization
+    this.itemSyncTimer = null;
   }
   
   /**
@@ -41,10 +63,8 @@ class MultiplayerService {
   init(gameScene, playerData) {
     this.gameScene = gameScene;
     
-    // Determine server URL based on environment
-    const serverUrl = process.env.NODE_ENV === 'production' 
-      ? window.location.origin 
-      : 'http://localhost:3000';
+    // Use the provided Render deployment URL
+    const serverUrl = 'https://dungeon-crawler-lazc.onrender.com';
     
     // Connect to socket.io server with better connection options for mobile devices
     this.socket = io(serverUrl, {
@@ -741,6 +761,134 @@ class MultiplayerService {
    */
   isOfflineMode() {
     return this.connectionState.offlineMode;
+  }
+
+  /**
+   * Start synchronization intervals for various game elements
+   * @param {Object} gameScene - The game scene object
+   */
+  startSyncIntervals(gameScene) {
+    // Clear any existing timers
+    this.clearSyncTimers();
+    
+    // Store reference to game scene
+    this.gameScene = gameScene;
+    
+    // Start player position updates
+    this.updateTimer = setInterval(() => {
+      if (gameScene.player && this.connectionState.connected) {
+        this.updateMovement({
+          x: gameScene.player.x,
+          y: gameScene.player.y,
+          direction: gameScene.player.direction,
+          animation: gameScene.player.anims.currentAnim ? gameScene.player.anims.currentAnim.key : 'player_idle_down'
+        });
+      }
+    }, this.syncConfig.updateRate);
+    
+    // Start enemy sync interval
+    this.enemySyncTimer = setInterval(() => {
+      if (gameScene.enemies && gameScene.enemies.length > 0 && this.connectionState.connected) {
+        this.syncEnemies(gameScene.enemies);
+      }
+    }, this.syncConfig.enemySyncRate);
+    
+    // Start item sync interval
+    this.itemSyncTimer = setInterval(() => {
+      if (gameScene.items && gameScene.items.length > 0 && this.connectionState.connected) {
+        this.syncItems(gameScene.items);
+      }
+    }, this.syncConfig.itemSyncRate);
+    
+    // Periodic full state sync
+    this.fullSyncTimer = setInterval(() => {
+      if (this.connectionState.connected) {
+        this.requestFullSync();
+      }
+    }, this.syncConfig.fullSyncRate);
+  }
+  
+  /**
+   * Clear all sync intervals
+   */
+  clearSyncTimers() {
+    if (this.updateTimer) clearInterval(this.updateTimer);
+    if (this.enemySyncTimer) clearInterval(this.enemySyncTimer);
+    if (this.itemSyncTimer) clearInterval(this.itemSyncTimer);
+    if (this.fullSyncTimer) clearInterval(this.fullSyncTimer);
+    
+    this.updateTimer = null;
+    this.enemySyncTimer = null;
+    this.itemSyncTimer = null;
+    this.fullSyncTimer = null;
+  }
+  
+  /**
+   * Sync all enemies to the server
+   * @param {Array} enemies - The array of enemy objects
+   */
+  syncEnemies(enemies) {
+    if (!this.socket || !this.connectionState.connected) return;
+    
+    // Only the host should sync enemies to prevent conflicts
+    if (this.isHost()) {
+      const enemiesData = enemies.map(enemy => ({
+        id: enemy.id || enemy.enemyId, // Use consistent ID property
+        type: enemy.enemyType,
+        x: enemy.x,
+        y: enemy.y,
+        health: enemy.health,
+        isDead: enemy.isDead || false,
+        state: enemy.state || 'idle'
+      }));
+      
+      // Send full enemy state
+      this.socket.emit('syncEnemies', enemiesData);
+    }
+  }
+  
+  /**
+   * Sync all items to the server
+   * @param {Array} items - The array of item objects
+   */
+  syncItems(items) {
+    if (!this.socket || !this.connectionState.connected) return;
+    
+    // Only the host should sync items to prevent conflicts
+    if (this.isHost()) {
+      const itemsData = items.map(item => ({
+        id: item.id || item.itemId || `item_${items.indexOf(item)}`,
+        type: item.itemType,
+        x: item.x,
+        y: item.y,
+        collected: item.collected || false
+      }));
+      
+      this.socket.emit('syncItems', itemsData);
+    }
+  }
+  
+  /**
+   * Request a full sync from the server
+   */
+  requestFullSync() {
+    if (!this.socket || !this.connectionState.connected) return;
+    
+    this.socket.emit('requestFullSync', {
+      room: this.gameScene.roomId || 'default'
+    });
+  }
+  
+  /**
+   * Check if this client is the host (first player in the room)
+   * @returns {boolean} Whether this client is the host
+   */
+  isHost() {
+    // If we're the first player to join, we're the host
+    // The server should send this information
+    return this.connectionState.isHost || 
+           (this.gameScene && this.gameScene.isHost) || 
+           Object.keys(this.otherPlayers).length === 0;
   }
 }
 
