@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, minimal-ui, viewport-fit=cover">
+  <meta http-equiv="X-UA-Compatible" content="ie=edge">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Dungeon Crawler Game</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      width: 100%;
+      height: 100%;
+      background-color: #000;
+      position: fixed; /* Prevent bounce on touch devices */
+      touch-action: none; /* Disable browser handling of touch gestures */
+    }
+    #game-container {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+    }
+    canvas {
+      display: block;
+      margin: 0 auto;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+    /* Loading overlay */
+    #loading-screen {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background-color: #000;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      z-index: 100;
+      transition: opacity 0.5s;
+    }
+    #loading-text {
+      color: #fff;
+      font-family: Arial, sans-serif;
+      font-size: 24px;
+      margin-top: 20px;
+    }
+    #loading-bar-container {
+      width: 80%;
+      max-width: 300px;
+      height: 20px;
+      background-color: #333;
+      border-radius: 10px;
+      margin-top: 20px;
+      overflow: hidden;
+    }
+    #loading-bar {
+      width: 0%;
+      height: 100%;
+      background-color: #0095ff;
+      transition: width 0.2s;
+    }
+    /* Mobile console styles */
+    #mobile-console {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      width: 100%;
+      max-height: 30%;
+      background-color: rgba(0, 0, 0, 0.7);
+      color: #0f0;
+      font-family: monospace;
+      font-size: 12px;
+      overflow-y: auto;
+      z-index: 1000;
+      display: none;
+    }
+    #mobile-console.visible {
+      display: block;
+    }
+    #mobile-console-toggle {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background-color: rgba(0, 0, 0, 0.7);
+      color: white;
+      border: 1px solid white;
+      border-radius: 5px;
+      padding: 5px;
+      z-index: 1001;
+      font-size: 12px;
+    }
+    .console-line {
+      padding: 2px 5px;
+      border-bottom: 1px solid #333;
+      word-break: break-all;
+    }
+    .console-line.error {
+      color: #ff0000;
+    }
+    .console-line.warn {
+      color: #ffff00;
+    }
+  </style>
+</head>
+<body>
+  <!-- Loading screen -->
+  <div id="loading-screen">
+    <div id="loading-text">Loading game...</div>
+    <div id="loading-bar-container">
+      <div id="loading-bar"></div>
+    </div>
+  </div>
+  
+  <div id="game-container"></div>
+  
+  <div id="mobile-console"></div>
+  <button id="mobile-console-toggle">Toggle Console</button>
+  
+  <script>
+    // Hide loading screen when game is ready
+    window.addEventListener('load', function() {
+      // Setup a timeout to hide the loading screen after the game loads
+      setTimeout(function() {
+        var loadingScreen = document.getElementById('loading-screen');
+        loadingScreen.style.opacity = 0;
+        setTimeout(function() {
+          loadingScreen.style.display = 'none';
+        }, 500);
+      }, 1000);
+    });
+
+    // Mobile console implementation
+    (function() {
+      const consoleElement = document.getElementById('mobile-console');
+      const toggleButton = document.getElementById('mobile-console-toggle');
+      
+      // Toggle console visibility
+      toggleButton.addEventListener('click', function() {
+        consoleElement.classList.toggle('visible');
+      });
+
+      // Store original console methods
+      const originalConsole = {
+        log: console.log,
+        error: console.error,
+        warn: console.warn,
+        info: console.info
+      };
+
+      // Function to add message to mobile console
+      function addToMobileConsole(message, type) {
+        const line = document.createElement('div');
+        line.className = 'console-line ' + (type || '');
+        
+        // Convert objects to string representation
+        if (typeof message === 'object') {
+          try {
+            message = JSON.stringify(message);
+          } catch (e) {
+            message = String(message);
+          }
+        }
+
+        line.textContent = message;
+        consoleElement.appendChild(line);
+        
+        // Auto-scroll to bottom
+        consoleElement.scrollTop = consoleElement.scrollHeight;
+        
+        // Limit number of lines (keep last 100)
+        while (consoleElement.children.length > 100) {
+          consoleElement.removeChild(consoleElement.children[0]);
+        }
+      }
+
+      // Override console methods
+      console.log = function() {
+        originalConsole.log.apply(console, arguments);
+        Array.from(arguments).forEach(arg => addToMobileConsole(arg));
+      };
+      
+      console.error = function() {
+        originalConsole.error.apply(console, arguments);
+        Array.from(arguments).forEach(arg => addToMobileConsole(arg, 'error'));
+      };
+      
+      console.warn = function() {
+        originalConsole.warn.apply(console, arguments);
+        Array.from(arguments).forEach(arg => addToMobileConsole(arg, 'warn'));
+      };
+      
+      console.info = function() {
+        originalConsole.info.apply(console, arguments);
+        Array.from(arguments).forEach(arg => addToMobileConsole(arg));
+      };
+      
+      // Add initial message
+      addToMobileConsole('Mobile console initialized. Tap the button in the top right to toggle visibility.');
+    })();
+  </script>
+</body>
+</html>

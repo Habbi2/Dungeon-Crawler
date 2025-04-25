@@ -1,0 +1,22 @@
+services:
+  # Web service for the game server
+  - type: web
+    name: dungeon-crawler-game
+    env: node
+    buildCommand: npm install && npm run build
+    startCommand: npm run server
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+    plan: free # Or choose a different plan based on your needs
+
+    # Uncomment if you need a database in the future
+    # - type: redis
+    #   name: redis
+    #   ipAllowList: []
+    #   plan: free
+    
+    # Auto-deploy on changes to main branch
+    autoDeploy: true
